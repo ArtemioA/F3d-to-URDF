@@ -4,6 +4,9 @@ import os
 import math
 import traceback
 
+# =========================================================
+# Utility helpers
+# =========================================================
 
 def _get_app_ui():
     app = adsk.core.Application.get()
@@ -29,7 +32,9 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
     except Exception:
         scale = 0.01
 
-    x, y, z = p.x * scale, p.y * scale, p.z * scale
+    x = p.x * scale
+    y = p.y * scale
+    z = p.z * scale
 
     r11, r12, r13 = m.getCell(0, 0), m.getCell(0, 1), m.getCell(0, 2)
     r21, r22, r23 = m.getCell(1, 0), m.getCell(1, 1), m.getCell(1, 2)
@@ -48,14 +53,87 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
     return (x, y, z), (roll, pitch, yaw)
 
 
+def _copy_matrix(m: adsk.core.Matrix3D) -> adsk.core.Matrix3D:
+    nm = adsk.core.Matrix3D.create()
+    nm.copy(m)
+    return nm
+
+
+def _inverse_matrix(m: adsk.core.Matrix3D) -> adsk.core.Matrix3D:
+    inv = adsk.core.Matrix3D.create()
+    inv.copy(m)
+    inv.invert()
+    return inv
+
+
+def _mul_matrix(a: adsk.core.Matrix3D, b: adsk.core.Matrix3D) -> adsk.core.Matrix3D:
+    """Devuelve a * b (asumiendo transformBy hace self * other)."""
+    r = adsk.core.Matrix3D.create()
+    r.copy(a)
+    r.transformBy(b)
+    return r
+
+
+def _axis_world_to_parent(axis, parent_world: adsk.core.Matrix3D):
+    """
+    Convierte un eje expresado en coords mundo a coords del parent.
+    parent_world: transform del parent (link) al mundo.
+    """
+    ax, ay, az = axis
+    # Rotación (parent->world)
+    r00 = parent_world.getCell(0, 0)
+    r01 = parent_world.getCell(0, 1)
+    r02 = parent_world.getCell(0, 2)
+    r10 = parent_world.getCell(1, 0)
+    r11 = parent_world.getCell(1, 1)
+    r12 = parent_world.getCell(1, 2)
+    r20 = parent_world.getCell(2, 0)
+    r21 = parent_world.getCell(2, 1)
+    r22 = parent_world.getCell(2, 2)
+
+    # parent_vec = R^T * world_vec
+    px = r00 * ax + r10 * ay + r20 * az
+    py = r01 * ax + r11 * ay + r21 * az
+    pz = r02 * ax + r12 * ay + r22 * az
+
+    length = math.sqrt(px * px + py * py + pz * pz)
+    if length > 1e-9:
+        px /= length
+        py /= length
+        pz /= length
+
+    return (px, py, pz)
+
+
+# =========================================================
+# Robot Exporter
+# =========================================================
+
 class RobotExporter:
     """
-    Exporta todos los sólidos como STL y genera un URDF con joints funcionales:
+    Exporta un diseño Fusion 360 (f3d) a URDF + STL con la semántica deseada:
 
-    - Un link por occurrence con sólidos.
-    - Joints desde Fusion (joints + asBuiltJoints).
-    - Revolute/Slider con <limit>; sin límites -> continuous o rango amplio.
-    - Links sin joint -> fixed al base_link.
+      - Un link por occurrence con sólidos.
+
+      - Si NO hay joints:
+          * Si hay una sola pieza: URDF con un solo link.
+          * Si hay varias piezas:
+                base_link en el origen +
+                cada pieza fixed a base_link
+                usando su pose real (occ.transform2).
+            (Este es tu caso "perfectamente fijo".)
+
+      - Si HAY joints:
+          * Para joints/asBuiltJoints:
+                se crean joints URDF entre los links correspondientes.
+                El origen del joint se obtiene como:
+                    T_p_c = inv(T_world_parent) * T_world_child
+                (usando occ.transform2).
+          * Links que no aparecen en ningún joint:
+                fixed a base_link con su pose real (occ.transform2).
+          * Links que son raíz de un árbol de joints (parent pero nunca child):
+                también se anclan a base_link con su pose real.
+          * El resto de links solo se mueve según los joints (no se congela todo).
     """
 
     def __init__(self, robot_name: str, base_output_dir: str = None):
@@ -80,25 +158,61 @@ class RobotExporter:
 
         self.links = []          # [{name, mesh, occ}]
         self.joints = []         # [{name,parent,child,type,origin_xyz,origin_rpy,axis,limit}]
-        self.occ_to_link = {}    # occ_key(str) -> link_name
+        self.occ_to_link = {}    # occKey -> link name
+        self.link_world = {}     # link_name -> Matrix3D world transform
         self.base_link_name = None
+        self.single_link_no_joints = False
 
-    # ========================= API =========================
+    # -----------------------------------------------------
+    # Public API
+    # -----------------------------------------------------
+
     def export_all(self):
         try:
             self._log(f"[ACDC4Robot] Exportando robot '{self.robot_name}'...")
-            self._build_links_and_joints()
+            self._build_links()
+            self._build_joints()
             self._export_meshes()
             self._write_urdf()
             self._log(f"[ACDC4Robot] Export completado en:\n{self.output_dir}")
         except Exception:
-            if self.ui:
-                self.ui.messageBox("Error en RobotExporter.export_all():\n\n" + traceback.format_exc())
+            msg = "Error en RobotExporter.export_all():\n\n" + traceback.format_exc()
+            self._log(msg, also_messagebox=True)
             raise
 
-    # ==================== Helpers Occ keys =================
+    # -----------------------------------------------------
+    # Logging
+    # -----------------------------------------------------
+
+    def _log(self, msg: str, also_messagebox: bool = False):
+        try:
+            if self.ui:
+                try:
+                    palettes = self.ui.palettes
+                    text_palette = palettes.itemById('TextCommands')
+                    if text_palette:
+                        text_palette.writeText(msg)
+                except:
+                    pass
+
+                if also_messagebox:
+                    try:
+                        self.ui.messageBox(msg)
+                    except:
+                        pass
+            else:
+                print(msg)
+        except:
+            try:
+                print(msg)
+            except:
+                pass
+
+    # -----------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------
+
     def _occ_key(self, occ) -> str:
-        """Clave hashable estable para una occurrence."""
         if occ is None:
             return ""
         try:
@@ -118,13 +232,30 @@ class RobotExporter:
         except:
             return str(id(occ))
 
-    # ============ Build links & joints from Fusion =========
-    def _build_links_and_joints(self):
-        root = self.design.rootComponent
+    def _get_world_matrix(self, occ):
+        """Transform del link (component) al mundo."""
+        if not occ:
+            m = adsk.core.Matrix3D.create()
+            return m  # identidad
+        try:
+            m = occ.transform2
+            if m:
+                return m
+        except:
+            pass
+        m = adsk.core.Matrix3D.create()
+        return m
 
-        # 1) Links por occurrence con sólidos
+    # -----------------------------------------------------
+    # Build links
+    # -----------------------------------------------------
+
+    def _build_links(self):
+        root = self.design.rootComponent
+        all_occs = list(root.allOccurrences)
+
         idx = 0
-        for occ in root.allOccurrences:
+        for occ in all_occs:
             comp = occ.component
             has_bodies = False
             try:
@@ -132,90 +263,126 @@ class RobotExporter:
                     has_bodies = True
             except:
                 pass
+
             if not has_bodies:
                 continue
 
             link_name = _sanitize(f"link_{idx}_{occ.name}")
             mesh_name = f"{link_name}.stl"
+
+            self.links.append({"name": link_name, "mesh": mesh_name, "occ": occ})
+            self.occ_to_link[self._occ_key(occ)] = link_name
+            self.link_world[link_name] = self._get_world_matrix(occ)
             idx += 1
-
-            self.links.append({
-                "name": link_name,
-                "mesh": mesh_name,
-                "occ": occ,
-            })
-
-            key = self._occ_key(occ)
-            if key:
-                self.occ_to_link[key] = link_name
 
         if not self.links:
             raise RuntimeError("[ACDC4Robot] No se encontraron occurrences con sólidos.")
 
-        # 2) base_link (grounded si existe)
-        self.base_link_name = self._choose_base_link()
-        self._log(f"[ACDC4Robot] base_link seleccionado: {self.base_link_name}")
+        has_joints = self._has_fusion_joints(root)
 
-        # 3) Joints desde Fusion
+        # Si solo hay una pieza y no hay joints -> URDF mínimo
+        if not has_joints and len(self.links) == 1:
+            self.single_link_no_joints = True
+            self.base_link_name = None
+            self._log("[ACDC4Robot] Una sola pieza sin joints -> URDF con un solo link.")
+            return
+
+        # Si hay varias piezas o joints, creamos base_link
+        self.base_link_name = "base_link"
+        self.links.insert(0, {"name": self.base_link_name, "mesh": None, "occ": None})
+        # base_link en el origen (identidad)
+        self.link_world[self.base_link_name] = adsk.core.Matrix3D.create()
+        self._log(f"[ACDC4Robot] base_link creado en el origen.")
+
+    def _has_fusion_joints(self, root) -> bool:
+        try:
+            if len(root.joints) > 0:
+                return True
+        except:
+            pass
+        try:
+            if len(root.asBuiltJoints) > 0:
+                return True
+        except:
+            pass
+        return False
+
+    # -----------------------------------------------------
+    # Build joints
+    # -----------------------------------------------------
+
+    def _build_joints(self):
+        if self.single_link_no_joints:
+            return
+
+        # 1) Joints desde Fusion
         self._create_joints_from_fusion()
 
-        # 4) Links sueltos -> fixed al base_link
-        attached_children = {j["child"] for j in self.joints}
+        # 2) Analizar quién está conectado
+        joint_children = {j["child"] for j in self.joints}
+        joint_parents = {j["parent"] for j in self.joints}
+
+        # 3) Links totalmente aislados -> fixed a base_link usando pose real
         for link in self.links:
             name = link["name"]
             if name == self.base_link_name:
                 continue
-            if name not in attached_children:
-                occ = link.get("occ")
-                try:
-                    if occ and hasattr(occ, "transform2"):
-                        xyz, rpy = _matrix_to_xyz_rpy(occ.transform2, self.design)
-                    else:
-                        xyz, rpy = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
-                except:
-                    xyz, rpy = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
-
-                j_name = f"auto_fixed_{name}"
+            if name not in joint_children and name not in joint_parents:
+                m = self.link_world.get(name)
+                (x, y, z), (r, p, yv) = _matrix_to_xyz_rpy(m, self.design)
                 self.joints.append({
-                    "name": j_name,
+                    "name": f"fixed_{name}",
                     "parent": self.base_link_name,
                     "child": name,
                     "type": "fixed",
-                    "origin_xyz": xyz,
-                    "origin_rpy": rpy,
+                    "origin_xyz": (x, y, z),
+                    "origin_rpy": (r, p, yv),
                     "axis": (0.0, 0.0, 1.0),
                     "limit": None,
                 })
-                self._log(f"[ACDC4Robot] Joint fijo auto: {self.base_link_name} -> {name}")
+                self._log(f"[ACDC4Robot] Link aislado fijado: base_link -> {name}")
 
-    def _choose_base_link(self) -> str:
-        # grounded primero
+        # 4) Raíces de árboles de joints (parent pero nunca child)
+        joint_children = {j["child"] for j in self.joints}
+        joint_parents = {j["parent"] for j in self.joints}
         for link in self.links:
-            occ = link.get("occ")
-            try:
-                if hasattr(occ, "isGrounded") and occ.isGrounded:
-                    return link["name"]
-            except:
-                pass
-        return self.links[0]["name"]
+            name = link["name"]
+            if name in (self.base_link_name, None):
+                continue
+            if name in joint_parents and name not in joint_children:
+                # Si ya tiene padre, saltar
+                if any(j["child"] == name for j in self.joints):
+                    continue
+                m = self.link_world.get(name)
+                (x, y, z), (r, p, yv) = _matrix_to_xyz_rpy(m, self.design)
+                self.joints.append({
+                    "name": f"root_{name}",
+                    "parent": self.base_link_name,
+                    "child": name,
+                    "type": "fixed",
+                    "origin_xyz": (x, y, z),
+                    "origin_rpy": (r, p, yv),
+                    "axis": (0.0, 0.0, 1.0),
+                    "limit": None,
+                })
+                self._log(
+                    f"[ACDC4Robot] Raíz de árbol de joints fijada: base_link -> {name}"
+                )
 
     def _create_joints_from_fusion(self):
         root = self.design.rootComponent
-        all_joints = []
+        all_fusion_joints = []
 
         try:
-            for j in root.joints:
-                all_joints.append(j)
+            all_fusion_joints.extend(root.joints)
         except:
             pass
         try:
-            for j in root.asBuiltJoints:
-                all_joints.append(j)
+            all_fusion_joints.extend(root.asBuiltJoints)
         except:
             pass
 
-        if not all_joints:
-            self._log("[ACDC4Robot] No Fusion joints encontrados.")
+        if not all_fusion_joints:
             return
 
         try:
@@ -225,26 +392,38 @@ class RobotExporter:
 
         used_children = set()
 
-        for j in all_joints:
+        for j in all_fusion_joints:
             try:
                 occ1 = getattr(j, "occurrenceOne", None)
                 occ2 = getattr(j, "occurrenceTwo", None)
 
                 k1 = self._occ_key(occ1)
                 k2 = self._occ_key(occ2)
-
                 l1 = self.occ_to_link.get(k1)
                 l2 = self.occ_to_link.get(k2)
                 if not l1 or not l2:
                     continue
 
+                # Elegir parent/child estable
                 parent, child = self._pick_parent_child(l1, l2, used_children)
                 used_children.add(child)
 
-                jtype, axis, limit = self._map_joint_type_axis_limit(j, JointTypes)
-                ox, oy, oz, rr, pp, yy = self._get_joint_origin_from_fusion(j)
+                # Transforms mundo de parent/child
+                Tp = self.link_world.get(parent)
+                Tc = self.link_world.get(child)
+                if not Tp or not Tc:
+                    continue
 
-                j_name = _sanitize(j.name) if j.name else f"joint_{parent}_to_{child}"
+                # Origen del joint: T_p_c = inv(Tp) * Tc
+                invTp = _inverse_matrix(Tp)
+                Tpc = _mul_matrix(invTp, Tc)
+                (ox, oy, oz), (rr, pp, yy) = _matrix_to_xyz_rpy(Tpc, self.design)
+
+                # Tipo, eje y límites
+                jtype, axis_world, limit = self._map_joint_type_axis_limit(j, JointTypes)
+                axis = _axis_world_to_parent(axis_world, Tp) if axis_world else (0.0, 0.0, 1.0)
+
+                j_name = _sanitize(getattr(j, "name", "") or f"joint_{parent}_to_{child}")
 
                 self.joints.append({
                     "name": j_name,
@@ -254,144 +433,101 @@ class RobotExporter:
                     "origin_xyz": (ox, oy, oz),
                     "origin_rpy": (rr, pp, yy),
                     "axis": axis,
-                    "limit": limit,   # None or (lower, upper)
+                    "limit": limit,
                 })
+                self._log(
+                    f"[ACDC4Robot] Joint Fusion->URDF: {j_name} ({jtype}) {parent}->{child}"
+                )
 
-                self._log(f"[ACDC4Robot] Joint Fusion -> URDF: {j_name} ({jtype}) {parent}->{child} limit={limit}")
             except Exception:
-                self._log("[ACDC4Robot] Error procesando un joint de Fusion:")
-                self._log(traceback.format_exc())
+                self._log(
+                    "[ACDC4Robot] Error procesando joint Fusion:\n" + traceback.format_exc()
+                )
 
     def _pick_parent_child(self, l1: str, l2: str, used_children: set):
-        if l1 == self.base_link_name:
-            return l1, l2
-        if l2 == self.base_link_name:
-            return l2, l1
         if l1 in used_children and l2 not in used_children:
             return l2, l1
         if l2 in used_children and l1 not in used_children:
             return l1, l2
+        # fallback determinista
         return (l1, l2) if l1 < l2 else (l2, l1)
 
     def _map_joint_type_axis_limit(self, j, JointTypes):
-        """
-        Devuelve (jtype, axis, limit):
-        - jtype: 'fixed', 'revolute', 'continuous', 'prismatic'
-        - axis: (x,y,z)
-        - limit: None o (lower, upper) en rad o m
-        """
         jtype = "fixed"
-        axis = (0.0, 0.0, 1.0)
+        axis = None
         limit = None
 
-        motion = None
-        try:
-            motion = j.jointMotion
-        except:
-            pass
+        motion = getattr(j, "jointMotion", None)
+        jt = getattr(motion, "jointType", None)
 
-        jt = None
-        try:
-            if motion:
-                jt = motion.jointType
-        except:
-            jt = None
-
-        # Tipo base
-        try:
-            if JointTypes and jt is not None:
+        if JointTypes and jt is not None:
+            try:
                 if jt == JointTypes.RigidJointType:
                     jtype = "fixed"
                 elif jt == JointTypes.RevoluteJointType:
                     jtype = "revolute"
                 elif jt == JointTypes.SliderJointType:
                     jtype = "prismatic"
-                else:
-                    jtype = "fixed"
-        except:
-            jtype = "fixed"
+            except:
+                pass
 
-        # Eje
+        # Eje en mundo
         try:
             if motion and hasattr(motion, "rotationAxisVector"):
                 av = motion.rotationAxisVector
                 axis = (av.x, av.y, av.z)
-            else:
-                geo = getattr(j, "geometry", None)
-                if geo and hasattr(geo, "primaryAxisVector"):
-                    av = geo.primaryAxisVector
-                    axis = (av.x, av.y, av.z)
+            elif hasattr(j, "geometry") and j.geometry and hasattr(j.geometry, "primaryAxisVector"):
+                av = j.geometry.primaryAxisVector
+                axis = (av.x, av.y, av.z)
         except:
-            pass
+            axis = None
 
-        # Normalizar eje si tiene sentido
-        try:
-            length = math.sqrt(axis[0]**2 + axis[1]**2 + axis[2]**2)
-            if length > 1e-6:
+        if axis:
+            length = math.sqrt(axis[0] ** 2 + axis[1] ** 2 + axis[2] ** 2)
+            if length > 1e-9:
                 axis = (axis[0]/length, axis[1]/length, axis[2]/length)
-            else:
-                axis = (0.0, 0.0, 1.0)
-        except:
-            axis = (0.0, 0.0, 1.0)
 
-        # Límites desde Fusion si existen
+        # Límites
         if jtype == "revolute":
-            try:
-                rl = getattr(motion, "rotationLimits", None)
-                if rl:
-                    lo = None
-                    hi = None
-                    if getattr(rl, "isMinimumValueEnabled", False):
-                        lo = rl.minimumValue
-                    if getattr(rl, "isMaximumValueEnabled", False):
-                        hi = rl.maximumValue
-                    if lo is not None and hi is not None and hi > lo:
-                        limit = (lo, hi)
-            except:
-                pass
-
-            # Si no hay límites -> continuous (ideal p/ ruedas)
+            rl = getattr(motion, "rotationLimits", None)
+            if rl:
+                lo = hi = None
+                if getattr(rl, "isMinimumValueEnabled", False):
+                    lo = rl.minimumValue
+                if getattr(rl, "isMaximumValueEnabled", False):
+                    hi = rl.maximumValue
+                if lo is not None and hi is not None and hi > lo:
+                    # Heurística grados->rad
+                    if abs(lo) > 2*math.pi or abs(hi) > 2*math.pi:
+                        lo = math.radians(lo)
+                        hi = math.radians(hi)
+                    limit = (lo, hi)
             if limit is None:
                 jtype = "continuous"
-                # continuous en URDF no lleva lower/upper, solo effort/velocity
 
         elif jtype == "prismatic":
-            try:
-                sl = getattr(motion, "slideLimits", None)
-                if sl:
-                    lo = None
-                    hi = None
-                    if getattr(sl, "isMinimumValueEnabled", False):
-                        lo = sl.minimumValue
-                    if getattr(sl, "isMaximumValueEnabled", False):
-                        hi = sl.maximumValue
-                    if lo is not None and hi is not None and hi > lo:
-                        limit = (lo, hi)
-            except:
-                pass
-
-            # Si no hay límites, damos algo pequeño para que el viewer pueda mover
+            sl = getattr(motion, "slideLimits", None)
+            if sl:
+                lo = hi = None
+                if getattr(sl, "isMinimumValueEnabled", False):
+                    lo = sl.minimumValue
+                if getattr(sl, "isMaximumValueEnabled", False):
+                    hi = sl.maximumValue
+                if lo is not None and hi is not None and hi > lo:
+                    limit = (lo, hi)
             if limit is None:
                 limit = (-0.1, 0.1)
 
         return jtype, axis, limit
 
-    def _get_joint_origin_from_fusion(self, j):
-        """Origen (xyz,rpy) del joint. Si falla, 0."""
-        try:
-            geo = getattr(j, "geometryOrOriginTwo", None)
-            if geo and hasattr(geo, "transform"):
-                m = geo.transform
-                (ox, oy, oz), (rr, pp, yy) = _matrix_to_xyz_rpy(m, self.design)
-                return ox, oy, oz, rr, pp, yy
-        except:
-            pass
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    # -----------------------------------------------------
+    # STL export — same spirit as your working script
+    # -----------------------------------------------------
 
-    # ===================== STL export ======================
     def _export_meshes(self):
         export_mgr = self.design.exportManager
         root = self.design.rootComponent
+        all_occs = list(root.allOccurrences)
 
         for link in self.links:
             mesh_name = link.get("mesh")
@@ -399,8 +535,18 @@ class RobotExporter:
                 continue
 
             stl_path = os.path.join(self.meshes_dir, mesh_name)
-            occ = link.get("occ")
-            export_target = occ if occ else root
+            base_name = os.path.splitext(mesh_name)[0]
+
+            # Buscar occurrence correspondiente por nombre saneado (como tu script)
+            target_occ = None
+            for occ in all_occs:
+                if _sanitize(occ.name) in base_name:
+                    target_occ = occ
+                    break
+
+            export_target = target_occ or link.get("occ")
+            if not export_target:
+                export_target = root
 
             try:
                 stl_opts = export_mgr.createSTLExportOptions(export_target, stl_path)
@@ -408,24 +554,52 @@ class RobotExporter:
                     stl_opts.meshRefinement = adsk.fusion.MeshRefinementOptions.High
                 except:
                     try:
-                        stl_opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+                        stl_opts.meshRefinement = (
+                            adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+                        )
                     except:
                         pass
+
                 if hasattr(stl_opts, "isBinaryFormat"):
                     stl_opts.isBinaryFormat = True
 
                 export_mgr.execute(stl_opts)
                 self._log(f"[ACDC4Robot] STL generado: {stl_path}")
             except Exception:
-                self._log(f"[ACDC4Robot] Error exportando STL para link '{link.get('name','?')}'")
-                self._log(traceback.format_exc())
+                self._log(
+                    f"[ACDC4Robot] Error exportando STL para {link.get('name','?')}:\n"
+                    + traceback.format_exc()
+                )
 
-    # ===================== URDF writer =====================
+    # -----------------------------------------------------
+    # URDF writer
+    # -----------------------------------------------------
+
     def _write_urdf(self):
         urdf_path = os.path.join(self.output_dir, f"{self.robot_name}.urdf")
+        lines = [f'<robot name="{self.robot_name}">']
 
-        lines = []
-        lines.append(f'<robot name="{self.robot_name}">')
+        # Caso trivial: 1 link sin joints
+        if self.single_link_no_joints and len(self.links) == 1:
+            link = self.links[0]
+            name = link["name"]
+            mesh = link.get("mesh")
+
+            lines.append(f'  <link name="{name}">')
+            if mesh:
+                lines.append('    <visual>')
+                lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+                lines.append(
+                    f'      <geometry><mesh filename="meshes/{mesh}" '
+                    f'scale="0.001 0.001 0.001"/></geometry>'
+                )
+                lines.append('    </visual>')
+            lines.append('  </link>')
+            lines.append('</robot>')
+            with open(urdf_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            self._log(f"[ACDC4Robot] URDF generado (modelo único): {urdf_path}")
+            return
 
         # Links
         for link in self.links:
@@ -437,17 +611,22 @@ class RobotExporter:
             if mesh:
                 lines.append('    <visual>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-                lines.append(f'      <geometry><mesh filename="meshes/{mesh}" scale="0.001 0.001 0.001"/></geometry>')
+                lines.append(
+                    f'      <geometry><mesh filename="meshes/{mesh}" '
+                    f'scale="0.001 0.001 0.001"/></geometry>'
+                )
                 lines.append('    </visual>')
 
                 lines.append('    <collision>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-                lines.append(f'      <geometry><mesh filename="meshes/{mesh}" scale="0.001 0.001 0.001"/></geometry>')
+                lines.append(
+                    f'      <geometry><mesh filename="meshes/{mesh}" '
+                    f'scale="0.001 0.001 0.001"/></geometry>'
+                )
                 lines.append('    </collision>')
 
-            # Dummy inertial
+            # Inercial dummy
             lines.append('    <inertial>')
-            lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
             lines.append('      <mass value="1.0"/>')
             lines.append('      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>')
             lines.append('    </inertial>')
@@ -469,19 +648,15 @@ class RobotExporter:
             lines.append(f'    <origin xyz="{ox} {oy} {oz}" rpy="{rr} {pp} {yy}"/>')
             lines.append(f'    <parent link="{parent}"/>')
             lines.append(f'    <child link="{child}"/>')
-            lines.append(f'    <axis xyz="{ax} {ay} {az}"/>')
 
-            # Limits: crucial for interactividad
-            if jtype == "revolute":
-                # si vino con limit, úsalo; si no, amplio
-                lo, hi = limit if limit else (-6.28318, 6.28318)
-                lines.append(f'    <limit lower="{lo}" upper="{hi}" effort="10" velocity="10"/>')
-            elif jtype == "continuous":
-                # continuous: sin lower/upper
-                lines.append('    <limit effort="10" velocity="10"/>')
-            elif jtype == "prismatic":
-                lo, hi = limit if limit else (-0.1, 0.1)
-                lines.append(f'    <limit lower="{lo}" upper="{hi}" effort="10" velocity="10"/>')
+            if jtype in ("revolute", "continuous", "prismatic"):
+                lines.append(f'    <axis xyz="{ax} {ay} {az}"/>')
+
+            if limit is not None and jtype in ("revolute", "prismatic"):
+                lo, hi = limit
+                lines.append(
+                    f'    <limit lower="{lo}" upper="{hi}" effort="10" velocity="1"/>'
+                )
 
             lines.append('  </joint>')
 
@@ -489,22 +664,20 @@ class RobotExporter:
 
         with open(urdf_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-
         self._log(f"[ACDC4Robot] URDF generado: {urdf_path}")
 
-    # ======================= Logs ==========================
-    def _log(self, msg: str):
-        try:
-            print(msg)
-        except:
-            pass
-        # Para debug hardcore:
-        # if self.ui:
-        #     self.ui.messageBox(str(msg), "ACDC4Robot Debug")
 
+# =========================================================
+# Public entrypoint (used by ACDC4Robot.execute)
+# =========================================================
 
 def export_robot(robot_name: str, base_output_dir: str = None, *args, **kwargs):
-    """Helper llamado desde acdc4robot.py."""
+    """
+    Función helper llamada desde acdc4robot.py:
+
+        from core import robot
+        robot.export_robot("mi_robot")
+    """
     if robot_name is None and len(args) > 0:
         robot_name = args[0]
     if base_output_dir is None and len(args) > 1:
