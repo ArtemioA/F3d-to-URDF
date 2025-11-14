@@ -14,18 +14,34 @@ def _get_app_ui():
     return app, ui
 
 
+def _log(ui, msg: str):
+    try:
+        full = f"[ACDC4Robot] {msg}"
+        print(full)
+        if ui:
+            palette = ui.palettes.itemById("TextCommands")
+            if palette:
+                palette.writeText(full)
+    except:
+        # En caso de que algo falle en el logging, no romper la exportación
+        print("[ACDC4Robot][LOG-ERROR]", msg)
+
+
 def _sanitize(name: str) -> str:
     """Limpia nombres para URDF y archivos."""
     if not name:
         return "link"
-    bad = '<>:"/\\|?* '
+    bad = '<>:"/\\|?* ,.'
     for c in bad:
         name = name.replace(c, '_')
+    if name and name[0].isdigit():
+        name = "l_" + name
     return name
 
 
 def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
-    """Convierte Matrix3D de Fusion a (xyz, rpy) en metros."""
+    """Convierte Matrix3D de Fusion a (xyz, rpy) en metros.
+       *** ES EL MISMO SISTEMA DEL SCRIPT ANTIGUO QUE TE FUNCIONABA ***"""
     if m is None:
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
@@ -44,7 +60,7 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
     r21, r22, r23 = m.getCell(1, 0), m.getCell(1, 1), m.getCell(1, 2)
     r31, r32, r33 = m.getCell(2, 0), m.getCell(2, 1), m.getCell(2, 2)
 
-    # roll (X), pitch (Y), yaw (Z)
+    # roll (X), pitch (Y), yaw (Z) – MISMO ALGORITMO QUE TU SCRIPT BUENO
     if abs(r31) < 1.0:
         pitch = math.asin(-r31)
         roll = math.atan2(r32, r33)
@@ -58,18 +74,134 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
 
 
 # =========================================================
+# Recogida de cuerpos por occurrence (versión "antigua", por-cuerpo)
+# =========================================================
+
+def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
+    """
+    Devuelve 4 listas:
+      comp_brep_export, occ_brep_export, comp_mesh_export, occ_mesh_export
+
+    NO filtramos por isSolid, solo por visibilidad si se desea.
+    Además saca muchos logs para ver qué pasa con casos como id47:1.
+    """
+
+    comp = occ.component
+
+    # --- BREP BODIES ---
+
+    comp_brep_all = list(comp.bRepBodies)
+    occ_brep_all = list(occ.bRepBodies)
+
+    comp_brep_export = []
+    occ_brep_export = []
+
+    _log(ui, f"Analizando occurrence '{occ.name}'...")
+    _log(ui, f"  [DEBUG] bRep(component) total={len(comp_brep_all)}, bRep(occurrence) total={len(occ_brep_all)}")
+
+    # 1º preferimos cuerpos de la occurrence (proxies)
+    for b in occ_brep_all:
+        try:
+            is_solid = getattr(b, "isSolid", None)
+            is_visible = getattr(b, "isVisible", None)
+        except:
+            is_solid = None
+            is_visible = None
+
+        # No filtramos por isSolid; podrías filtrar por visibilidad si quieres.
+        export = True
+        # if is_visible is False:
+        #     export = False
+
+        _log(ui, f"    [occ.bRep] body='{b.name}' isSolid={is_solid} visible={is_visible} -> export={export}")
+
+        if export:
+            occ_brep_export.append(b)
+
+    # Si no hay cuerpos en la occurrence, usamos los del componente
+    if not occ_brep_export:
+        for b in comp_brep_all:
+            try:
+                is_solid = getattr(b, "isSolid", None)
+                is_visible = getattr(b, "isVisible", None)
+            except:
+                is_solid = None
+                is_visible = None
+
+            export = True
+            # if is_visible is False:
+            #     export = False
+
+            _log(ui, f"    [comp.bRep] body='{b.name}' isSolid={is_solid} visible={is_visible} -> export={export}")
+
+            if export:
+                comp_brep_export.append(b)
+
+    # --- MESH BODIES ---
+
+    comp_mesh_all = list(getattr(comp, "meshBodies", []))
+    occ_mesh_all = list(getattr(occ, "meshBodies", []))
+
+    comp_mesh_export = []
+    occ_mesh_export = []
+
+    _log(ui, f"  [DEBUG] mesh(component) total={len(comp_mesh_all)}, mesh(occurrence) total={len(occ_mesh_all)}")
+
+    for m in occ_mesh_all:
+        vis = getattr(m, "isVisible", None)
+        export = True
+        # if vis is False:
+        #     export = False
+        _log(ui, f"    [occ.mesh] body='{m.name}' visible={vis} -> export={export}")
+        if export:
+            occ_mesh_export.append(m)
+
+    if not occ_mesh_export:
+        for m in comp_mesh_all:
+            vis = getattr(m, "isVisible", None)
+            export = True
+            # if vis is False:
+            #     export = False
+            _log(ui, f"    [comp.mesh] body='{m.name}' visible={vis} -> export={export}")
+            if export:
+                comp_mesh_export.append(m)
+
+    total_exportables = (
+        len(comp_brep_export)
+        + len(occ_brep_export)
+        + len(comp_mesh_export)
+        + len(occ_mesh_export)
+    )
+
+    _log(
+        ui,
+        "  Bodies en '{}': "
+        "bRep(comp)={}sel/{}tot, bRep(occ)={}sel/{}tot, "
+        "mesh(comp)={}sel/{}tot, mesh(occ)={}sel/{}tot, total_usados={}".format(
+            occ.name,
+            len(comp_brep_export), len(comp_brep_all),
+            len(occ_brep_export), len(occ_brep_all),
+            len(comp_mesh_export), len(comp_mesh_all),
+            len(occ_mesh_export), len(occ_mesh_all),
+            total_exportables,
+        ),
+    )
+
+    return comp_brep_export, occ_brep_export, comp_mesh_export, occ_mesh_export
+
+
+# =========================================================
 # Exporter
 # =========================================================
 
 class RobotExporter:
     """
     Exporta un diseño Fusion 360 (f3d) a URDF + STL:
-      - Un link por occurrence con sólidos.
+      - Un link por CUERPO (bRep/mesh) dentro de cada occurrence.
       - Joints de Fusion -> joints URDF.
       - PARTES SIN JOINTS: fixed a base_link con su pose real.
       - Raíces de árboles de joints ancladas a base_link.
       - Si solo hay una pieza sin joints -> URDF de un solo link.
-      - AHORA TAMBIÉN: cuerpos sólidos directos en el rootComponent ("normal parts").
     """
 
     def __init__(self, robot_name: str, base_output_dir: str = None):
@@ -93,12 +225,13 @@ class RobotExporter:
         os.makedirs(self.meshes_dir, exist_ok=True)
 
         # Cada link puede tener:
-        #   - "occ": occurrence (para componentes/ocurrencias normales)
-        #   - "body": BRepBody directo en root (normal parts)
+        #   - "occ": occurrence (para saber la pose global)
+        #   - "item": BRepBody o MeshBody concreto que se exportará a STL
         #   - "mesh": nombre de archivo STL
-        self.links = []          # [{name, mesh, occ, body}]
+        #   - "kind": "brep" o "mesh"
+        self.links = []          # [{name, mesh, occ, item, kind}]
         self.joints = []         # [{name,parent,child,type,origin_xyz,origin_rpy,axis,limit}]
-        self.occ_to_link = {}    # occurrenceKey -> link name
+        self.occ_to_link = {}    # occurrenceKey -> link PRINCIPAL (para joints de Fusion)
         self.base_link_name = None
         self.single_link_no_joints = False
 
@@ -108,7 +241,7 @@ class RobotExporter:
 
     def export_all(self):
         try:
-            self._log(f"[ACDC4Robot] Exportando robot '{self.robot_name}'...")
+            self._log(f"=== EXPORTANDO '{self.robot_name}' ===")
             self._build_links_and_joints()
             self._export_meshes()
             self._write_urdf()
@@ -123,26 +256,10 @@ class RobotExporter:
     # -----------------------------------------------------
 
     def _log(self, msg: str, also_messagebox: bool = False):
-        try:
-            if self.ui:
-                try:
-                    palettes = self.ui.palettes
-                    text_palette = palettes.itemById('TextCommands')
-                    if text_palette:
-                        text_palette.writeText(msg)
-                except:
-                    pass
-
-                if also_messagebox:
-                    try:
-                        self.ui.messageBox(msg)
-                    except:
-                        pass
-            else:
-                print(msg)
-        except:
+        _log(self.ui, msg)
+        if also_messagebox and self.ui:
             try:
-                print(msg)
+                self.ui.messageBox(msg)
             except:
                 pass
 
@@ -173,8 +290,8 @@ class RobotExporter:
     def _occ_abs_pose(self, occ):
         """
         Pose absoluta (root) de una occurrence.
-        Tu sistema antiguo asumía que occ.transform2 ya está en coordenadas globales.
-        Lo mantenemos igual porque te funcionaba bien.
+        Usa EXACTAMENTE el sistema antiguo: occ.transform2 en global +
+        _matrix_to_xyz_rpy.
         """
         if not occ:
             return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
@@ -193,31 +310,79 @@ class RobotExporter:
         root = self.design.rootComponent
         all_occs = list(root.allOccurrences)
 
+        self._log(f"[DBG] _build_links_and_joints(): total occurrences = {len(all_occs)}")
+
         # -----------------------------------------
-        # 1) Crear links por occurrences con sólidos
+        # 1) Crear links por CUERPOS en cada occurrence
         # -----------------------------------------
         idx = 0
         for occ in all_occs:
-            comp = occ.component
-            has_bodies = False
-            try:
-                if comp and any(b.isSolid for b in comp.bRepBodies):
-                    has_bodies = True
-            except:
-                pass
-            if not has_bodies:
+            comp_brep, occ_brep, comp_mesh, occ_mesh = _collect_bodies_for_occurrence(occ, self.ui)
+
+            # Preferimos proxies de occurrence; si no, los del componente.
+            bodies = occ_brep if occ_brep else comp_brep
+            meshes = occ_mesh if occ_mesh else comp_mesh
+
+            exported_items = []
+            kind = None
+            if bodies:
+                exported_items = bodies
+                kind = "brep"
+            elif meshes:
+                exported_items = meshes
+                kind = "mesh"
+
+            if not exported_items:
+                self._log(f"[DBG] Occurrence '{occ.name}' sin cuerpos exportables -> omitida")
                 continue
 
-            link_name = _sanitize(f"link_{idx}_{occ.name}")
-            mesh_name = f"{link_name}.stl"
+            occ_key = self._occ_key(occ)
+
+            # Link principal de la occurrence (primer cuerpo/mesh)
+            main_item = exported_items[0]
+            main_name = _sanitize(f"link_{idx}_{occ.name}")
+            main_mesh = f"{main_name}.stl"
+
             self.links.append({
-                "name": link_name,
-                "mesh": mesh_name,
+                "name": main_name,
+                "mesh": main_mesh,
                 "occ": occ,
-                "body": None
+                "item": main_item,
+                "kind": kind,
             })
-            self.occ_to_link[self._occ_key(occ)] = link_name
+            self.occ_to_link[occ_key] = main_name
+            self._log(f"[DBG] Link principal para occurrence '{occ.name}': {main_name} (item='{main_item.name}')")
             idx += 1
+
+            # Links extra para cuerpos adicionales del mismo componente
+            for i, extra in enumerate(exported_items[1:], start=1):
+                extra_name = _sanitize(f"link_{idx}_{occ.name}_b{i}_{extra.name}")
+                extra_mesh = f"{extra_name}.stl"
+
+                self.links.append({
+                    "name": extra_name,
+                    "mesh": extra_mesh,
+                    "occ": occ,
+                    "item": extra,
+                    "kind": kind,
+                })
+                idx += 1
+
+                self._log(
+                    f"  + Extra body link: {extra_name} (body='{extra.name}') fixed a {main_name}"
+                )
+
+                # Joint fijo extra -> principal (sin offset extra, ya que el STL se exporta en coords del body)
+                self.joints.append({
+                    "name": f"fixed_extra_{extra_name}",
+                    "parent": main_name,
+                    "child": extra_name,
+                    "type": "fixed",
+                    "origin_xyz": (0.0, 0.0, 0.0),
+                    "origin_rpy": (0.0, 0.0, 0.0),
+                    "axis": (0.0, 0.0, 1.0),
+                    "limit": None,
+                })
 
         # -----------------------------------------
         # 1.b) Cuerpos directos en el rootComponent (normal parts)
@@ -228,25 +393,24 @@ class RobotExporter:
             root_bodies = []
 
         for i, body in enumerate(root_bodies):
-            # Para evitar duplicados con occurrences ya creadas,
-            # asumimos que estos bodies son "sueltos" en el root.
             link_name = _sanitize(f"root_body_{i}_{body.name}")
             mesh_name = f"{link_name}.stl"
             self.links.append({
                 "name": link_name,
                 "mesh": mesh_name,
-                "occ": None,    # no hay occurrence
-                "body": body
+                "occ": None,     # no hay occurrence
+                "item": body,
+                "kind": "brep",
             })
             self._log(f"[ACDC4Robot] Link root-body creado: {link_name}")
 
         if not self.links:
             raise RuntimeError("[ACDC4Robot] No se encontraron solids (occurrences ni root bodies).")
 
-        has_joints = self._has_fusion_joints(root)
+        has_fusion_joints = self._has_fusion_joints(root)
 
         # Caso especial: una sola pieza sin joints
-        if not has_joints and len(self.links) == 1:
+        if not has_fusion_joints and len(self.links) == 1:
             self.single_link_no_joints = True
             self.base_link_name = None
             self._log("[ACDC4Robot] Una sola pieza sin joints -> URDF con un solo link.")
@@ -260,24 +424,25 @@ class RobotExporter:
             "name": self.base_link_name,
             "mesh": None,
             "occ": None,
-            "body": None
+            "item": None,
+            "kind": "none",
         })
         self._log("[ACDC4Robot] base_link creado en el origen.")
 
         # -----------------------------------------
         # 3) Joints desde Fusion
         # -----------------------------------------
-        if has_joints:
+        if has_fusion_joints:
             self._create_joints_from_fusion()
 
-        # Conjuntos para saber quién participa en joints
+        # Conjuntos para saber quién participa en joints (incluye fijos extra)
         joint_children = {j["child"] for j in self.joints}
         joint_parents = {j["parent"] for j in self.joints}
 
         # -----------------------------------------
         # 4) Partes que NO participan en ningún joint -> fixed a base_link con pose absoluta
-        #    - Para occurrences: usa _occ_abs_pose(occ) (tu sistema antiguo que te funcionaba).
-        #    - Para root bodies: origin = 0 (el STL ya está en coords globales del root).
+        #    - Para occurrences: usa _occ_abs_pose(occ).
+        #    - Para root bodies: origin = 0 (el STL ya está en coords del root).
         # -----------------------------------------
         for link in self.links:
             name = link["name"]
@@ -285,13 +450,10 @@ class RobotExporter:
                 continue
             if name not in joint_children and name not in joint_parents:
                 occ = link.get("occ")
-                body = link.get("body")
 
                 if occ is not None:
                     xyz, rpy = self._occ_abs_pose(occ)
                 else:
-                    # Body directo en root: lo exportamos en coords del root,
-                    # así que el joint a base_link puede tener origen 0.
                     xyz, rpy = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
                 self.joints.append({
@@ -304,11 +466,11 @@ class RobotExporter:
                     "axis": (0.0, 0.0, 1.0),
                     "limit": None,
                 })
-                self._log(f"[ACDC4Robot] Joint fijo (sin joints) base_link -> {name}")
+                self._log(f"[ACDC4Robot] Joint fijo (sin joints) base_link -> {name}  "
+                          f"XYZ={xyz}  RPY={rpy}")
 
         # -----------------------------------------
         # 5) Raíces de árboles de joints (padres que nunca son hijos) -> anclar a base_link
-        #    (solo si aún no tienen ningún joint como child)
         # -----------------------------------------
         joint_children = {j["child"] for j in self.joints}  # actualizado
         for link in self.links:
@@ -319,12 +481,10 @@ class RobotExporter:
                 already = any(j["child"] == name for j in self.joints)
                 if not already:
                     occ = link.get("occ")
-                    body = link.get("body")
 
                     if occ is not None:
                         xyz, rpy = self._occ_abs_pose(occ)
                     else:
-                        # Igual criterio: body en root -> origen 0.
                         xyz, rpy = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
                     self.joints.append({
@@ -337,7 +497,8 @@ class RobotExporter:
                         "axis": (0.0, 0.0, 1.0),
                         "limit": None,
                     })
-                    self._log(f"[ACDC4Robot] Joint fijo (root joint tree) base_link -> {name}")
+                    self._log(f"[ACDC4Robot] Joint fijo (root joint tree) base_link -> {name}  "
+                              f"XYZ={xyz}  RPY={rpy}")
 
     def _has_fusion_joints(self, root) -> bool:
         try:
@@ -409,7 +570,8 @@ class RobotExporter:
                     "axis": axis,
                     "limit": limit,
                 })
-                self._log(f"[ACDC4Robot] Joint Fusion -> URDF: {j_name} ({jtype}) {parent}->{child}")
+                self._log(f"[ACDC4Robot] Joint Fusion -> URDF: {j_name} ({jtype}) {parent}->{child} "
+                          f"origin=({ox},{oy},{oz}) rpy=({rr},{pp},{yy})")
             except Exception:
                 self._log("[ACDC4Robot] Error procesando joint Fusion:\n" + traceback.format_exc())
 
@@ -506,13 +668,11 @@ class RobotExporter:
             if not mesh_name:
                 continue
 
+            item = link.get("item")
             occ = link.get("occ")
-            body = link.get("body")
 
-            # Elegimos el objeto para exportar:
-            #   - si hay occurrence -> exportamos esa occurrence (comportamiento antiguo)
-            #   - si no, usamos el BRepBody directo (root body)
-            export_target = occ if occ is not None else body
+            # AHORA: exportamos SIEMPRE el cuerpo/mesh concreto, NO la occurrence completa.
+            export_target = item if item is not None else occ
             if not export_target:
                 continue
 
@@ -521,9 +681,13 @@ class RobotExporter:
             try:
                 stl_opts = export_mgr.createSTLExportOptions(export_target, stl_path)
                 try:
+                    # Alta calidad si está disponible
                     stl_opts.meshRefinement = adsk.fusion.MeshRefinementOptions.High
                 except:
-                    pass
+                    try:
+                        stl_opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+                    except:
+                        pass
                 if hasattr(stl_opts, "isBinaryFormat"):
                     stl_opts.isBinaryFormat = True
 
@@ -599,7 +763,7 @@ class RobotExporter:
                 )
                 lines.append('    </collision>')
 
-            # Inercia dummy para que los simuladores no se quejen
+            # Inercia dummy
             lines.append('    <inertial>')
             lines.append('      <mass value="1.0"/>')
             lines.append('      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>')
