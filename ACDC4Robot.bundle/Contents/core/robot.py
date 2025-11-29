@@ -926,6 +926,9 @@ class RobotExporter:
         """
         Versión básica: devuelve (vertices_m, indices) para un BRepBody o MeshBody.
         NO maneja UV ni textura, se usa como fallback.
+
+        >>> NEW:
+        - Para BRep usamos TriangleMeshCalculator.setQuality(VeryHigh) para subir calidad.
         """
         is_brep = hasattr(body, "meshManager")
         is_mesh_body = hasattr(body, "mesh")
@@ -941,11 +944,34 @@ class RobotExporter:
                 mesh = None
                 try:
                     tri_opts = mesh_mgr.createMeshCalculator()
+
+                    # >>> NEW: alta calidad de malla
+                    try:
+                        from adsk.fusion import TriangleMeshQualityOptions
+                        tri_opts.setQuality(TriangleMeshQualityOptions.VeryHighQualityTriangleMesh)
+                        self._log("[DBG][MESH] TriangleMeshCalculator.setQuality(VeryHighQualityTriangleMesh)")
+                    except Exception:
+                        # Fallback: ajustar tolerancia manualmente
+                        try:
+                            bbox = body.boundingBox
+                            dx = bbox.maxPoint.x - bbox.minPoint.x
+                            dy = bbox.maxPoint.y - bbox.minPoint.y
+                            dz = bbox.maxPoint.z - bbox.minPoint.z
+                            diameter = math.sqrt(dx*dx + dy*dy + dz*dz)
+                            # equivalente aproximado a LOD 15
+                            tri_opts.surfaceTolerance = diameter / (2.0 ** 15)
+                            self._log(f"[DBG][MESH] surfaceTolerance={tri_opts.surfaceTolerance}")
+                        except Exception:
+                            tri_opts.surfaceTolerance = 0.01
+                            self._log("[DBG][MESH] surfaceTolerance fallback=0.01cm")
+
                     mesh = tri_opts.calculate()
                 except:
+                    # fallback: displayMeshes
                     try:
                         if mesh_mgr.displayMeshes.count > 0:
                             mesh = mesh_mgr.displayMeshes.item(0)
+                            self._log("[DBG][MESH] Usando displayMeshes como fallback.")
                     except:
                         pass
 
@@ -1011,6 +1037,11 @@ class RobotExporter:
           - genera atlas PNG con un patch por cara
           - cada cara tiene un UV (u,v) fijo (centro del patch)
         Devuelve (vertices, indices, uvs, texture_filename)
+
+        >>> NEW:
+        - Usa setQuality(VeryHigh) por cara.
+        - Si alguna cara no se puede triangular o el resultado total está vacío,
+          hace fallback a malla básica del cuerpo para NO omitir BREP.
         """
         self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
 
@@ -1040,7 +1071,9 @@ class RobotExporter:
 
         tex_name = geom_id + ".png"
         tex_path = os.path.join(self.meshes_dir, tex_name)
-        w, h, uv_centers = _build_faces_atlas_png(tex_path, face_colors, cell_px=32)
+
+        # >>> NEW: subir resolución del atlas (mejor calidad de “textura”)
+        w, h, uv_centers = _build_faces_atlas_png(tex_path, face_colors, cell_px=64)
 
         if not uv_centers:
             color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
@@ -1059,6 +1092,8 @@ class RobotExporter:
         except Exception:
             scale = 0.01
 
+        faces_with_mesh = 0
+
         for i in range(faces.count):
             f = faces.item(i)
             uv_u, uv_v = uv_centers[i]
@@ -1066,7 +1101,27 @@ class RobotExporter:
             try:
                 mesh_mgr = f.meshManager
                 calc = mesh_mgr.createMeshCalculator()
+
+                # >>> NEW: alta calidad de malla cara por cara
+                try:
+                    from adsk.fusion import TriangleMeshQualityOptions
+                    calc.setQuality(TriangleMeshQualityOptions.VeryHighQualityTriangleMesh)
+                except Exception:
+                    # Fallback: tolerancia pequeña
+                    try:
+                        bbox = f.boundingBox
+                        dx = bbox.maxPoint.x - bbox.minPoint.x
+                        dy = bbox.maxPoint.y - bbox.minPoint.y
+                        dz = bbox.maxPoint.z - bbox.minPoint.z
+                        diameter = math.sqrt(dx*dx + dy*dy + dz*dz)
+                        calc.surfaceTolerance = diameter / (2.0 ** 15)
+                    except Exception:
+                        calc.surfaceTolerance = 0.01
+
                 mesh = calc.calculate()
+                if not mesh:
+                    self._log(f"[ACDC4Robot] Cara {i}: mesh = None, se omite.")
+                    continue
             except Exception as e:
                 self._log(f"[ACDC4Robot] Error mesh en cara {i}: {e}")
                 continue
@@ -1078,6 +1133,11 @@ class RobotExporter:
 
             idxs_face = list(mesh.nodeIndices)
 
+            if not coords or not idxs_face:
+                self._log(f"[ACDC4Robot] Cara {i}: mesh vacío, se omite.")
+                continue
+
+            faces_with_mesh += 1
             base_index = len(verts_m) // 3
 
             for k in range(0, len(coords), 3):
@@ -1089,6 +1149,20 @@ class RobotExporter:
 
             for idx in idxs_face:
                 indices.append(base_index + int(idx))
+
+        if faces_with_mesh == 0 or not verts_m or not indices:
+            # >>> NEW: fallback para NO PERDER el cuerpo si falla el modo cara-por-cara
+            self._log("[ACDC4Robot] WARNING: triangulación por caras falló, usando malla básica.")
+            verts, idxs = self._get_mesh_triangles_from_body_basic(body)
+            if not verts or not idxs:
+                return [], [], [], None
+
+            # usar textura sólida con el color promedio (por simplicidad usamos color global)
+            color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
+            _build_solid_png(tex_path, color, size=4)
+            nverts = len(verts) // 3
+            uvs = [0.5, 0.5] * nverts
+            return verts, idxs, uvs, tex_name
 
         self._log(f"[ACDC4Robot] BRepBody triangulado cara por cara: verts={len(verts_m)//3}, tris={len(indices)//3}")
         return verts_m, indices, uvs, tex_name
@@ -1266,6 +1340,10 @@ class RobotExporter:
         - Para BRepBody: atlas de textura PNG por cara.
         - Para MeshBody: textura sólida por .dae.
         En todos los casos: 1 .png por .dae en la misma carpeta.
+
+        >>> NEW:
+        - Más logs cuando un BREP se omite.
+        - Fallbacks internos evitan perder cuerpos.
         """
         for link in self.links:
             mesh_name = link.get("mesh")
