@@ -1,3 +1,4 @@
+
 import adsk.core
 import adsk.fusion
 import os
@@ -106,7 +107,7 @@ def _png_write_rgba(filepath: str, width: int, height: int, pixels_rgba: bytes):
         f.write(png)
 
 
-def _build_faces_atlas_png(png_path: str, face_colors: list, cell_px: int = 32):
+def _build_faces_atlas_png(png_path: str, face_colors: list, cell_px: int = 128):
     """
     face_colors: lista de (r,g,b,a) en [0..1] por cara.
     Genera un atlas en grid (celdas cell_px x cell_px) y devuelve:
@@ -203,6 +204,7 @@ def _build_solid_png(png_path: str, color: tuple, size: int = 4):
 
 # =========================================================
 # Recogida de cuerpos por occurrence
+#  (idéntico sistema que tu exportador STL)
 # =========================================================
 
 def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
@@ -217,6 +219,7 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
     _log(ui, f"Analizando occurrence '{occ.name}'...")
     _log(ui, f"  [DEBUG] bRep(component) total={len(comp_brep_all)}, bRep(occurrence) total={len(occ_brep_all)}")
 
+    # Primero bodies de la occurrence
     for b in occ_brep_all:
         try:
             is_solid = getattr(b, "isSolid", None)
@@ -230,6 +233,7 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
         if export:
             occ_brep_export.append(b)
 
+    # Si no hay en occurrence, usamos los del componente
     if not occ_brep_export:
         for b in comp_brep_all:
             try:
@@ -252,6 +256,7 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
 
     _log(ui, f"  [DEBUG] mesh(component) total={len(comp_mesh_all)}, mesh(occurrence) total={len(occ_mesh_all)}")
 
+    # Primero meshBodies de la occurrence
     for m in occ_mesh_all:
         vis = getattr(m, "isVisible", None)
         export = True
@@ -259,6 +264,7 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
         if export:
             occ_mesh_export.append(m)
 
+    # Si no hay mesh en occurrence, usamos los del componente
     if not occ_mesh_export:
         for m in comp_mesh_all:
             vis = getattr(m, "isVisible", None)
@@ -325,6 +331,24 @@ class RobotExporter:
 
     # ------------------------------
 
+    def _get_body_in_component_space(self, body):
+        """
+        Devuelve el cuerpo nativo del componente si 'body' es un proxy
+        en contexto de ensamblaje (tiene nativeObject + assemblyContext).
+        Esto evita doble transformación y mejora la precisión de malla.
+        (NO cambia el sistema de poses, solo la base geométrica).
+        """
+        try:
+            native = getattr(body, "nativeObject", None)
+            ctx = getattr(body, "assemblyContext", None)
+            if native and ctx:
+                return native
+        except:
+            pass
+        return body
+
+    # ------------------------------
+
     def export_all(self):
         try:
             self._log(f"=== EXPORTANDO '{self.robot_name}' ===")
@@ -368,6 +392,10 @@ class RobotExporter:
             return str(id(occ))
 
     def _occ_abs_pose(self, occ):
+        """
+        MISMO SISTEMA que tu exportador STL para obtener
+        posición (xyz) y orientación (rpy) absolutas de la occurrence.
+        """
         if not occ:
             return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
         try:
@@ -377,6 +405,8 @@ class RobotExporter:
             pass
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
+    # ------------------------------
+    # MISMO SISTEMA DE LINKS/Joints que el STL, pero con .dae
     # ------------------------------
 
     def _build_links_and_joints(self):
@@ -390,6 +420,7 @@ class RobotExporter:
         for occ in all_occs:
             comp_brep, occ_brep, comp_mesh, occ_mesh = _collect_bodies_for_occurrence(occ, self.ui)
 
+            # EXACTO: bodies = occ_brep primero, luego comp_brep
             bodies = occ_brep if occ_brep else comp_brep
             meshes = occ_mesh if occ_mesh else comp_mesh
 
@@ -409,6 +440,7 @@ class RobotExporter:
             occ_key = self._occ_key(occ)
 
             main_item = exported_items[0]
+            # Aquí cambiamos solo la extensión a .dae
             main_name = _sanitize(f"link_{idx}_{occ.name}")
             main_mesh = f"{main_name}.dae"
 
@@ -423,6 +455,7 @@ class RobotExporter:
             self._log(f"[DBG] Link principal para occurrence '{occ.name}': {main_name} (item='{main_item.name}')")
             idx += 1
 
+            # Extras bodies de la misma occurrence/component -> fixed al main
             for i, extra in enumerate(exported_items[1:], start=1):
                 extra_name = _sanitize(f"link_{idx}_{occ.name}_b{i}_{extra.name}")
                 extra_mesh = f"{extra_name}.dae"
@@ -564,6 +597,7 @@ class RobotExporter:
 
     # -----------------------------------------------------
     # Fusion joints -> URDF (solo móviles)
+    # (mismo sistema que STL)
     # -----------------------------------------------------
 
     def _create_joints_from_fusion(self):
@@ -603,7 +637,7 @@ class RobotExporter:
 
                 jtype, axis, limit = self._map_joint_type_axis_limit(j, JointTypes)
 
-                # Ignorar joints rígidos
+                # *** CLAVE: ignorar joints rígidos (no afectan a la pose absoluta) ***
                 if jtype == "fixed":
                     self._log(self.ui, f"[DBG] Joint rígido ignorado: {getattr(j,'name','(sin nombre)')}")
                     continue
@@ -714,6 +748,8 @@ class RobotExporter:
     # -----------------------------------------------------
 
     def _log_brep_body_properties(self, body):
+        body = self._get_body_in_component_space(body)
+
         try:
             cls = getattr(body, "classType", lambda: type(body))()
         except:
@@ -778,7 +814,7 @@ class RobotExporter:
         except:
             return None
 
-        # 1) propiedad "Color"
+        # 1) propiedad "Color" explícita
         try:
             p = props.itemByName("Color")
             if p:
@@ -822,6 +858,8 @@ class RobotExporter:
         """
         if not body:
             return None
+
+        body = self._get_body_in_component_space(body)
 
         # 1) body.appearance
         try:
@@ -927,9 +965,11 @@ class RobotExporter:
         Versión básica: devuelve (vertices_m, indices) para un BRepBody o MeshBody.
         NO maneja UV ni textura, se usa como fallback.
 
-        >>> NEW:
         - Para BRep usamos TriangleMeshCalculator.setQuality(VeryHigh) para subir calidad.
+        - Siempre trabajamos en el cuerpo nativo del componente para evitar errores de posición.
         """
+        body = self._get_body_in_component_space(body)
+
         is_brep = hasattr(body, "meshManager")
         is_mesh_body = hasattr(body, "mesh")
 
@@ -945,7 +985,7 @@ class RobotExporter:
                 try:
                     tri_opts = mesh_mgr.createMeshCalculator()
 
-                    # >>> NEW: alta calidad de malla
+                    # alta calidad de malla
                     try:
                         from adsk.fusion import TriangleMeshQualityOptions
                         tri_opts.setQuality(TriangleMeshQualityOptions.VeryHighQualityTriangleMesh)
@@ -958,7 +998,6 @@ class RobotExporter:
                             dy = bbox.maxPoint.y - bbox.minPoint.y
                             dz = bbox.maxPoint.z - bbox.minPoint.z
                             diameter = math.sqrt(dx*dx + dy*dy + dz*dz)
-                            # equivalente aproximado a LOD 15
                             tri_opts.surfaceTolerance = diameter / (2.0 ** 15)
                             self._log(f"[DBG][MESH] surfaceTolerance={tri_opts.surfaceTolerance}")
                         except Exception:
@@ -1037,12 +1076,9 @@ class RobotExporter:
           - genera atlas PNG con un patch por cara
           - cada cara tiene un UV (u,v) fijo (centro del patch)
         Devuelve (vertices, indices, uvs, texture_filename)
-
-        >>> NEW:
-        - Usa setQuality(VeryHigh) por cara.
-        - Si alguna cara no se puede triangular o el resultado total está vacío,
-          hace fallback a malla básica del cuerpo para NO omitir BREP.
         """
+        body = self._get_body_in_component_space(body)
+
         self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
 
         faces = getattr(body, "faces", None)
@@ -1052,7 +1088,6 @@ class RobotExporter:
             if not verts or not idxs:
                 return [], [], [], None
 
-            # UV y textura sólida
             tex_name = geom_id + ".png"
             tex_path = os.path.join(self.meshes_dir, tex_name)
             color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
@@ -1072,8 +1107,8 @@ class RobotExporter:
         tex_name = geom_id + ".png"
         tex_path = os.path.join(self.meshes_dir, tex_name)
 
-        # >>> NEW: subir resolución del atlas (mejor calidad de “textura”)
-        w, h, uv_centers = _build_faces_atlas_png(tex_path, face_colors, cell_px=64)
+        # Atlas de mayor resolución
+        w, h, uv_centers = _build_faces_atlas_png(tex_path, face_colors, cell_px=128)
 
         if not uv_centers:
             color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
@@ -1102,12 +1137,11 @@ class RobotExporter:
                 mesh_mgr = f.meshManager
                 calc = mesh_mgr.createMeshCalculator()
 
-                # >>> NEW: alta calidad de malla cara por cara
+                # alta calidad por cara
                 try:
                     from adsk.fusion import TriangleMeshQualityOptions
                     calc.setQuality(TriangleMeshQualityOptions.VeryHighQualityTriangleMesh)
                 except Exception:
-                    # Fallback: tolerancia pequeña
                     try:
                         bbox = f.boundingBox
                         dx = bbox.maxPoint.x - bbox.minPoint.x
@@ -1151,13 +1185,11 @@ class RobotExporter:
                 indices.append(base_index + int(idx))
 
         if faces_with_mesh == 0 or not verts_m or not indices:
-            # >>> NEW: fallback para NO PERDER el cuerpo si falla el modo cara-por-cara
             self._log("[ACDC4Robot] WARNING: triangulación por caras falló, usando malla básica.")
             verts, idxs = self._get_mesh_triangles_from_body_basic(body)
             if not verts or not idxs:
                 return [], [], [], None
 
-            # usar textura sólida con el color promedio (por simplicidad usamos color global)
             color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
             _build_solid_png(tex_path, color, size=4)
             nverts = len(verts) // 3
@@ -1171,6 +1203,8 @@ class RobotExporter:
         """
         MeshBody completo con una textura sólida (1 color) por .dae.
         """
+        body = self._get_body_in_component_space(body)
+
         verts, idxs = self._get_mesh_triangles_from_body_basic(body)
         if not verts or not idxs:
             return [], [], [], None
@@ -1341,9 +1375,7 @@ class RobotExporter:
         - Para MeshBody: textura sólida por .dae.
         En todos los casos: 1 .png por .dae en la misma carpeta.
 
-        >>> NEW:
-        - Más logs cuando un BREP se omite.
-        - Fallbacks internos evitan perder cuerpos.
+        Sistema de links/joints y poses = el mismo que el STL, solo cambia el formato.
         """
         for link in self.links:
             mesh_name = link.get("mesh")
@@ -1361,13 +1393,15 @@ class RobotExporter:
             geom_id = os.path.splitext(mesh_name)[0]
 
             try:
-                is_brep = hasattr(item, "faces") and hasattr(item, "meshManager")
-                is_mesh_body = hasattr(item, "mesh") or hasattr(item, "displayMesh")
+                item_native = self._get_body_in_component_space(item) if item is not None else None
+
+                is_brep = hasattr(item_native, "faces") and hasattr(item_native, "meshManager")
+                is_mesh_body = hasattr(item_native, "mesh") or hasattr(item_native, "displayMesh")
 
                 if is_brep:
-                    verts, idxs, uvs, tex_name = self._build_brep_mesh_and_texture(item, occ, geom_id)
+                    verts, idxs, uvs, tex_name = self._build_brep_mesh_and_texture(item_native, occ, geom_id)
                 elif is_mesh_body:
-                    verts, idxs, uvs, tex_name = self._build_meshbody_mesh_and_texture(item, occ, geom_id)
+                    verts, idxs, uvs, tex_name = self._build_meshbody_mesh_and_texture(item_native, occ, geom_id)
                 else:
                     verts, idxs = self._get_mesh_triangles_from_body_basic(export_target)
                     if not verts or not idxs:
@@ -1375,7 +1409,7 @@ class RobotExporter:
                         continue
                     tex_name = geom_id + ".png"
                     tex_path = os.path.join(self.meshes_dir, tex_name)
-                    color = self._extract_color_for_link(item, occ) or (0.7, 0.7, 0.7, 1.0)
+                    color = self._extract_color_for_link(item_native, occ) or (0.7, 0.7, 0.7, 1.0)
                     _build_solid_png(tex_path, color, size=4)
                     nverts = len(verts) // 3
                     uvs = [0.5, 0.5] * nverts
@@ -1406,6 +1440,7 @@ class RobotExporter:
 
     def _write_urdf(self):
         urdf_path = os.path.join(self.output_dir, f"{self.robot_name}.urdf")
+        os.makedirs(self.output_dir, exist_ok=True)
         lines = [f'<robot name="{self.robot_name}">']
 
         if self.single_link_no_joints and len(self.links) == 1:
